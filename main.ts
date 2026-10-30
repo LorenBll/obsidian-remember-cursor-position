@@ -116,6 +116,8 @@ export default class RememberCursorPosition extends Plugin {
 	lastKnownMarkdownFiles: Set<string> = new Set();
 	workspaceLoadUntil = 0;
 	pendingWorkspaceRestore = false;
+	startupPending = true;
+	layoutReadyTimer = 0;
 	excludedPatterns: RegExp[] = [];
 	excludedPatternsCache = '';
 
@@ -124,7 +126,6 @@ export default class RememberCursorPosition extends Plugin {
 
 		try {
 			this.db = await this.readDb();
-			this.pruneDb();
 			this.lastSavedDb = await this.readDb();
 		} catch (e) {
 			console.error(
@@ -183,9 +184,13 @@ export default class RememberCursorPosition extends Plugin {
 		);
 
 		this.app.workspace.onLayoutReady(() => {
-			window.setTimeout(() => {
+			this.layoutReadyTimer = window.setTimeout(async () => {
+				// Defer pruning until the vault/workspace is ready, so entries are
+				// not dropped because files have not been loaded yet.
+				this.pruneDb();
+				this.lastSavedDb = await this.readDb();
+
 				const activeFile = this.app.workspace.getActiveFile();
-				if (!activeFile) return;
 				const leaf = this.app.workspace.getMostRecentLeaf();
 				//@ts-ignore no-official-API
 				const leafId = leaf ? leaf.id : '';
@@ -195,17 +200,20 @@ export default class RememberCursorPosition extends Plugin {
 				// Panes visible at startup count as already shown, except the
 				// active one, so the forced restore below still runs for it.
 				this.rememberShownFiles(this.app.workspace.getActiveViewOfType(MarkdownView)?.leaf ?? null);
-				if (this.lastRestoredLeafFile !== guardKey) {
-					this.restoreEphemeralState();
+
+				// Startup is no longer pending: allow restoration and tracking.
+				this.startupPending = false;
+
+				if (activeFile && this.lastRestoredLeafFile !== guardKey) {
+					await this.restoreEphemeralState();
 				}
 			}, LAYOUT_READY_RESTORE_DELAY);
 		});
-
-		this.restoreEphemeralState();
 	}
 
 	onunload() {
 		window.clearTimeout(this.layoutChangeTimer);
+		window.clearTimeout(this.layoutReadyTimer);
 	}
 
 	renameFile(file: TAbstractFile, oldPath: string) {
@@ -323,6 +331,10 @@ export default class RememberCursorPosition extends Plugin {
 
 
 	checkEphemeralStateChanged() {
+		// Suppress position tracking until startup restoration has completed.
+		if (this.startupPending)
+			return;
+
 		// Never track positions while a hover preview window is focused.
 		if (this.isHoverPopoverActive())
 			return;
@@ -399,6 +411,10 @@ export default class RememberCursorPosition extends Plugin {
 
 
 	async restoreEphemeralState(file?: TFile) {
+		// Suppress early restoration until the workspace layout is ready.
+		if (this.startupPending)
+			return;
+
 		let fileName = this.app.workspace.getActiveFile()?.path;
 
 		if (fileName && this.loadingFile && this.lastLoadedFileName == fileName) //if already started loading
